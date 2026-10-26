@@ -103,29 +103,55 @@ Kartendaten beliebiger Herkunft (Vektor, CAD, Raster) werden in vier geometrisch
 +-----------------------------+             +-----------------------------+
 ```
 
-### Kernregeln der Postensetzer-Engine
+### Kernregeln & Parameter der Postensetzer-Engine (`CourseConfig`)
+
+| Parameter | Wertebereich | Default | Beschreibung |
+|---|---|---|---|
+| `num_routes` (`k_paths`) | `1` bis `5` | `3` | Maximale Anzahl physisch distinkter Alternativrouten pro Teilstrecke (Yen's K-Shortest Paths). |
+| `min_drift_m` | `> 0` Meter | `20.0 m` | Mindestabstand (Spreizung), die zwei Pfade aufweisen müssen, um als distinkte Routenoption gewertet zu werden. |
+| `route_choice_delta_threshold` | `0.0` bis `0.3` | `0.08 (8%)` | Maximale relative Zeitdifferenz zur Optimalroute, damit eine Alternative als echte Routenwahl zählt. |
+| `route_choice_bonus_weight` | `0` bis `500` | `150.0` | Belohnungsbonus im Bahn-Scoring für Teilstrecken mit echter Routenwahl. |
+| `leg_variance` | `0.0` bis `1.0` | `0.5` | Rhythmus-Steuerung: `0.0` = gleichmässige Längen; `> 0.4` = bewusster Rhythmuswechsel zwischen kurzen technischen Posten (100–250 m) und langen Schlägen (400–900 m). |
+| `allow_hairpin` | `Boolean` | `False` | Wenn `True`, werden spitze Kehren (< `min_angle_deg`) explizit erlaubt (z.B. für Sprint-OL im Park/Labyrinth). |
+| `min_angle_deg` | `0°` bis `120°` | `60.0°` | Mindestwinkel am Posten zwischen Anlauf und Ablauf zur Vermeidung von Gegenverkehr. |
+| `base_pace_s_per_m` | `> 0` | `0.3 s/m` | Basis-Lauftempo im flachen weissen Wald (0.3 s/m entspricht 5:00 min/km) für Laufzeitprognosen. |
+| `grid_resolution_m` | `10` bis `50` m | `25.0 m` | Räumliche Maschenweite des Navigationsgraphen. |
 
 1. **Routenwahl-Metrik (Drift & Zeitdifferenz)**:
-   - Berechnet die K kürzesten Pfade zwischen zwei Posten mittels **Yen's K-Shortest Paths** auf Basis von A*.
-   - Eine Teilstrecke besitzt *echte Routenwahl*, wenn mindestens zwei Routen vorliegen mit:
-     $$\Delta = \frac{\text{Kosten}_{\text{Pfad 2}} - \text{Kosten}_{\text{Pfad 1}}}{\text{Kosten}_{\text{Pfad 1}}} \le 8\%$$
-     und einer maximalen räumlichen Spreizung (Drift) $\ge \text{Schwellwert}$ (z.B. 25–40 m).
-   - Derartige Teilstrecken erhalten einen signifikanten **Route-Choice-Bonus** im Scoring.
+   - Berechnet bis zu $K$ Pfade zwischen zwei Posten mittels **Yen's K-Shortest Paths** auf Basis von A*.
+   - Nur Pfade mit einer räumlichen Spreizung $\text{Drift} \ge \text{min\_drift\_m}$ werden in die Alternativenliste aufgenommen.
+   - Jede gefundene Teilstrecken-Alternative liefert Distanz (m), berechnete Laufzeit (mm:ss min) und Höhenmeter (Hm).
+   - Eine Teilstrecke besitzt *echte Routenwahl*, wenn mindestens eine Alternative vorliegt mit:
+     $$\Delta = \frac{\text{Zeit}_{\text{Pfad 2}} - \text{Zeit}_{\text{Pfad 1}}}{\text{Zeit}_{\text{Pfad 1}}} \le 8\%$$
 
-2. **Geometrische Gültigkeit**:
+2. **Rhythmus- & Varianzsteuerung (`leg_variance`)**:
+   - Bewertet den Variationskoeffizienten $CV = \sigma / \mu$ der Teilstreckenlängen.
+   - Bei `leg_variance = 0.0` wird eine minimale Längenvarianz forciert.
+   - Bei `leg_variance >= 0.4` werden Bahnen bevorzugt, die kurze technische Teilstrecken ($\le 250\text{ m}$) gezielt mit langen Entscheidungsschlägen ($\ge 400\text{ m}$) kombinieren.
+
+3. **Geometrische Gültigkeit**:
    - **Kreuzungsverbot**: Gerade Verbindungslinien zwischen Posten dürfen einander nicht schneiden:
      $$\forall (L_i, L_j) \text{ mit } |i - j| > 1: L_i \cap L_j = \emptyset$$
-   - **Winkelprüfung (Spitze Kehren / Dog-legs)**:
-     Winkel $\alpha$ an Posten $P_i$ zwischen Anlauf $(P_{i-1} \to P_i)$ und Ablauf $(P_i \to P_{i+1})$ muss mindestens $\ge 60^\circ$ betragen (außer `allow_hairpin=True`), um Kollisionen und Gegenverkehr zu verhindern.
+   - **Winkelprüfung**: Wendewinkel $\alpha \ge \text{min\_angle\_deg}$ (ausser `allow_hairpin=True`).
 
-3. **Reaktives Verhalten (Sperrgebiete zuerst)**:
+4. **Reaktives Verhalten (Sperrgebiete zuerst)**:
    - Sperrzonen besitzen Priorität $\infty$.
-   - Bei Anlage oder Verschiebung einer Sperrzone werden betroffene Posten automatisch auf die nächstgelegene legale Koordinate projiziert.
-   - Alle Teilstrecken, deren Pfad die Sperrzone schneidet, werden sofort und transparent neu geroutet.
+   - Posten im Sperrgebiet werden automatisch an den Rand projiziert.
+   - Betroffene Teilstrecken werden unmittelbar neu geroutet.
 
 ---
 
-## 4. Roadmap
+## 4. Didaktischer 4-Stufen-Test (`test_core.py`)
+
+Das Testskript validiert das System in 4 strukturierten Stufen:
+- **Stufe 1 (Einzelposten)**: Prüft Postenkandidaten auf IOF-Merkmal, Sperrgebiete, Wasser und Dickicht 3.
+- **Stufe 2 (Zwei Posten)**: Prüft Distanzkorridore (Mindestabstand $\ge 60\text{ m}$) und Durchgängigkeit (Mauern/Barrieren).
+- **Stufe 3 (Teilstrecke mit K Routenwahlen)**: Validiert $K=3$ Pfade mit Mindest-Drift, Laufzeiten und Routenwahl-Erkennung.
+- **Stufe 4 (Gesamtbahn mit Varianz & Reaktivität)**: Generiert Bahn mit `leg_variance=0.6`, prüft Rhythmusmix und simuliert Sperrzonen-Verschiebung mit Auto-Rerouting.
+
+---
+
+## 5. Roadmap
 
 ### Phase 1: Backend- & Geometriekern (Aktueller Meilenstein)
 - [x] Initialisierung Projektstruktur und Dokumentation (`PROJECT.md`)

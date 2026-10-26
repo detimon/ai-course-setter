@@ -314,6 +314,14 @@ class IOFCode:
     START = "START"                 # Startplatz
     FINISH = "FINISH"               # Ziel
 
+    ALL = {
+        "101_knoll", "103_saddle", "104_depression", "105_pit",
+        "201_boulder", "203_cliff", "301_water_hole", "302_stream_junc",
+        "303_marsh", "401_veg_bound", "402_dist_tree", "403_root_stock",
+        "501_building", "502_path_junc", "503_wall_corner", "504_fence_corn",
+        "START", "FINISH"
+    }
+
 
 @dataclass
 class ControlCandidate:
@@ -491,6 +499,35 @@ class SemanticTerrainModel:
 
     def remove_forbidden_zone(self, zone_id: str) -> bool:
         return self.forbidden_zones.pop(zone_id, None) is not None
+
+    def is_control_legal(self, candidate: ControlCandidate) -> Tuple[bool, str]:
+        """
+        Prüft einen Postenkandidaten auf Regelkonformität:
+        1. Gültiger IOF-Merkmalscode
+        2. Ausserhalb von Sperrgebieten
+        3. Ausserhalb von unpassierbarem Gelände (Wasser, See, Privatgrund mit Reibung inf)
+        4. Nicht in extremem Dickicht 3 (Grün 3, Reibung >= 8.0)
+        """
+        # 1. IOF-Objekt prüfen
+        if not candidate.iof_code or (candidate.iof_code not in IOFCode.ALL and not candidate.is_start and not candidate.is_finish):
+            return (False, f"Posten '{candidate.id}' besitzt kein gültiges IOF-Objektmerkmal ({candidate.iof_code}).")
+
+        # 2. Sperrgebiete prüfen
+        if not self.is_point_allowed(candidate.point):
+            for fz in self.forbidden_zones.values():
+                if point_in_polygon(candidate.point, fz.polygon, include_boundary=True):
+                    return (False, f"Posten '{candidate.id}' liegt im Sperrgebiet '{fz.id}' ({fz.reason}).")
+            return (False, f"Posten '{candidate.id}' liegt in einem Sperrgebiet.")
+
+        # 3. Belaufbarkeitszone & Reibung prüfen
+        fric = self.get_friction_at_point(candidate.point)
+        if math.isinf(fric):
+            return (False, f"Posten '{candidate.id}' liegt in unpassierbarem Gelände (Wasser/Privatgrund mit Reibung inf).")
+
+        if fric >= 8.0:
+            return (False, f"Posten '{candidate.id}' liegt im unzumutbaren Dickicht 3 (Grün 3, Reibung {fric:.1f} >= 8.0).")
+
+        return (True, f"Posten '{candidate.id}' ist legal (Merkmal: {candidate.iof_code}, Reibung: {fric:.2f}).")
 
     # --- Raumabfragen & Reaktivität ---
     def is_point_allowed(self, point: Point) -> bool:

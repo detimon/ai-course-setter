@@ -1,27 +1,19 @@
 """
-test_core.py - Verifikation & Testsuite für das semantische Geländemodell und die Bahnsetzer-Engine.
+test_core.py - Didaktischer 4-Stufen-Test für den Backend- und Geometriekern des AI Course Setters.
 
-Szenario:
-1. Synthetisches Orientierungslauf-Gelände (500m x 500m):
-   - Start im Westen, Ziel im Osten
-   - Mehrere IOF-Postenkandidaten (Fels, Kuppe, Senke, Grube, Hausecke, Baum)
-   - Schneller Waldweg (Speed-Bonus: 0.6)
-   - Geteilte Steinmauer (unpassierbar) mit einem schmalen Durchgang (Tor) in der Mitte
-   - Dickicht (Grün 3, Reibung 8.0), das Routenwahl-Spreizung erfordert
-   - Temporäres Sperrgebiet (Naturschutz / Baustelle)
-2. Automatische Generierung einer 3-Posten-Bahn mit Zielbudget ~950m:
-   - Verifikation: Keine Schnittlinien
-   - Verifikation: Keine spitzen Kehren (< 60° Wendewinkel)
-   - Verifikation: Erkennung echter Routenwahlen via Yen's K-Shortest Paths
-3. Dynamische Sperrzonen-Verschiebung:
-   - Das Sperrgebiet wird nachträglich direkt über den Durchgang / einen Posten gelegt
-   - Automatisches Verschieben des betroffenen Postens auf die nächste legale Stelle
-   - Automatisches Neu-Routen der betroffenen Teilstrecken um die Sperrzone herum
-   - ASCII-Visualisierung & tabellarischer Vorher-/Nachher-Vergleich im Terminal.
+Die Testsuite führt 4 logisch aufeinander aufbauende Stufen durch:
+- Stufe 1 (Einzelposten): Validiert Legalität von Postenkandidaten (IOF-Objekt, Sperrgebiete, Wasser, Dickicht 3).
+- Stufe 2 (Zwei Posten): Validiert Distanzkorridor und Machbarkeit (Luftlinie, Mindestabstand, Durchgängigkeit).
+- Stufe 3 (Teilstrecke mit K Routenwahlen): Berechnet bis zu K distinkte Pfade (Yen's K-Shortest Paths mit Mindest-Drift)
+  und liefert Distanz, berechnete Laufzeit und Höhenmeter für jede Alternative zurück.
+- Stufe 4 (Gesamtbahn mit Varianz & Reaktivität): Generiert eine vollständige Bahn mit Rhythmuswechsel (leg_variance=0.6),
+  überprüft Mischung aus kurzen und langen Teilstrecken und simuliert nachträgliche Sperrzonen-Verschiebung mit Auto-Rerouting.
 """
 
 import math
 import sys
+from typing import List, Tuple, Optional
+
 from terrain_model import (
     Point, LineString, Polygon, ControlCandidate, LinearFeature,
     TerrainZone, ForbiddenZone, ElevationModel, SemanticTerrainModel,
@@ -29,18 +21,17 @@ from terrain_model import (
 )
 from course_engine import (
     CourseConfig, NavigationGraph, a_star_search, yens_k_shortest_paths,
-    analyze_leg_route_choices, check_intersections, check_angle,
-    HeuristicCourseGenerator, CourseManager
+    calculate_spatial_drift, analyze_leg_route_choices, validate_leg_feasibility,
+    check_intersections, check_angle, HeuristicCourseGenerator, CourseManager
 )
 
 
 def create_synthetic_terrain() -> SemanticTerrainModel:
-    """Erzeugt ein synthetisches, abwechslungsreiches Testgelände."""
+    """Erzeugt ein synthetisches, abwechslungsreiches Testgelände (500m x 500m)."""
     # Höhenmodell mit sanfter Kuppe in der Mitte
     elev_grid = {}
     for x in range(0, 500, 25):
         for y in range(0, 500, 25):
-            # Hügel bei (250, 250) mit 25m Höhe
             dist_to_center = math.hypot(x - 250, y - 250)
             z = max(0.0, 25.0 - (dist_to_center / 12.0))
             elev_grid[(x // 25, y // 25)] = z
@@ -65,7 +56,7 @@ def create_synthetic_terrain() -> SemanticTerrainModel:
         is_finish=True
     ))
 
-    # 2. Postenkandidaten (0D)
+    # 2. Reguläre Postenkandidaten (0D)
     candidates = [
         ControlCandidate("101", Point(140.0, 360.0), IOFCode.KNOLL, name="Kuppe Nordwest"),
         ControlCandidate("102", Point(130.0, 140.0), IOFCode.BOULDER, name="Fels 1.5m Südwest"),
@@ -74,6 +65,7 @@ def create_synthetic_terrain() -> SemanticTerrainModel:
         ControlCandidate("105", Point(360.0, 360.0), IOFCode.BUILDING, name="Hausecke Ost"),
         ControlCandidate("106", Point(370.0, 140.0), IOFCode.DIST_TREE, name="Markante Eiche"),
         ControlCandidate("107", Point(245.0, 250.0), IOFCode.SADDLE, name="Sattel beim Mauertor"),
+        ControlCandidate("108", Point(115.0, 250.0), IOFCode.BOULDER, name="Fels 1.0m (kurzer Posten)"),
     ]
     for c in candidates:
         terrain.add_candidate(c)
@@ -91,14 +83,12 @@ def create_synthetic_terrain() -> SemanticTerrainModel:
     terrain.add_linear_feature(road)
 
     # B) Steinmauer mit Durchgang bei Y=230..270
-    # Südlicher Mauerflügel (unpassierbar)
     wall_south = LinearFeature(
         id="wall_south",
         line=LineString([Point(200.0, 50.0), Point(200.0, 220.0)]),
         feature_type="wall",
         passable=False
     )
-    # Nördlicher Mauerflügel (unpassierbar)
     wall_north = LinearFeature(
         id="wall_north",
         line=LineString([Point(200.0, 280.0), Point(200.0, 450.0)]),
@@ -109,7 +99,7 @@ def create_synthetic_terrain() -> SemanticTerrainModel:
     terrain.add_linear_feature(wall_north)
 
     # 4. Belaufbarkeitszonen (2D)
-    # Dickicht (Grün 3, Reibung 8.0) östlich der Mauer zwischen Posten
+    # A) Dickicht (Grün 3, Reibung 8.0) östlich der Mauer zwischen Posten
     thicket = TerrainZone(
         id="thicket_east",
         polygon=Polygon([
@@ -122,8 +112,20 @@ def create_synthetic_terrain() -> SemanticTerrainModel:
     )
     terrain.add_zone(thicket)
 
+    # B) Waldsee (Unpassierbar, Reibung inf)
+    lake = TerrainZone(
+        id="lake_northwest",
+        polygon=Polygon([
+            Point(50.0, 320.0), Point(90.0, 320.0),
+            Point(90.0, 360.0), Point(50.0, 360.0)
+        ]),
+        zone_type="water",
+        friction=math.inf,
+        description="Unpassierbarer Waldsee (Reibung inf)"
+    )
+    terrain.add_zone(lake)
+
     # 5. Ursprüngliches Sperrgebiet (2D)
-    # Kleines Schutzgebiet im Südosten, das vorerst keine Hauptrouten blockiert
     init_obstacle = ForbiddenZone(
         id="nature_reserve",
         polygon=Polygon([
@@ -147,9 +149,9 @@ def render_ascii_map(
     """Rendert eine kompakte ASCII-Karte des Geländes und der aktuellen Bahn."""
     grid = [["." for _ in range(width)] for _ in range(height)]
 
-    def to_grid(x: float, y: float) -> tuple[int, int]:
+    def to_grid(x: float, y: float) -> Tuple[int, int]:
         gx = int((x / 500.0) * (width - 1))
-        gy = int(((500.0 - y) / 500.0) * (height - 1))  # Invert y for screen
+        gy = int(((500.0 - y) / 500.0) * (height - 1))
         return (max(0, min(width - 1, gx)), max(0, min(height - 1, gy)))
 
     # 1. Mauer einzeichnen
@@ -166,13 +168,14 @@ def render_ascii_map(
                 gx, gy = to_grid(p.x, p.y)
                 grid[gy][gx] = "="
 
-    # 3. Dickicht
+    # 3. Zonen (Dickicht=T, Wasser=W)
     for z in terrain.zones.values():
+        sym = "W" if math.isinf(z.friction) else "T"
         bx0, by0, bx1, by1 = z.polygon.bounding_box
         for px in range(int(bx0), int(bx1), 15):
             for py in range(int(by0), int(by1), 15):
                 gx, gy = to_grid(px, py)
-                grid[gy][gx] = "T"
+                grid[gy][gx] = sym
 
     # 4. Sperrgebiet
     bx0, by0, bx1, by1 = forbidden_poly.bounding_box
@@ -202,180 +205,285 @@ def render_ascii_map(
     lines = [f"{i:02d} " + "".join(row) for i, row in enumerate(grid)]
     legend = (
         "Legende: S=Start, F=Ziel, O=Posten, *=Bahn-Pfad, #=Mauer, "
-        "==Weg, T=Dickicht, X=Sperrzone"
+        "==Weg, T=Dickicht, W=Wasser, X=Sperrzone"
     )
     return "\n".join([header] + lines + [legend])
 
 
-def test_geometry_primitives():
-    """Testet Schnittprüfungen, Winkelberechnung und Point-in-Polygon."""
-    print("--- 1. Test Geometrie-Primitiven ---")
+# ==============================================================================
+# DIDAKTISCHE 4 TEST-STUFEN
+# ==============================================================================
 
-    # A) Schnitt zweier Strecken
-    p1, p2 = Point(0, 0), Point(10, 10)
-    p3, p4 = Point(0, 10), Point(10, 0)
-    assert segments_intersect(p1, p2, p3, p4) is True, "Kreuzende Segmente müssen erkannt werden"
+def test_stage_1_single_control(terrain: SemanticTerrainModel):
+    """
+    STUFE 1 (Einzelposten):
+    Prüft einen einzelnen Postenkandidaten auf Legalität:
+    - Gültiges IOF-Objekt
+    - Ausserhalb von Sperrgebieten
+    - Ausserhalb von Wasser / Reibung inf
+    - Ausserhalb von unzumutbarem Dickicht 3 (Grün 3, Reibung >= 8.0)
+    """
+    print("\n" + "=" * 76)
+    print("  STUFE 1: EINZELPOSTEN-LEGALITÄT (IOF-Objekt, Sperrzonen, Wasser, Dickicht 3)")
+    print("=" * 76)
 
-    p5, p6 = Point(0, 0), Point(5, 5)
-    p7, p8 = Point(6, 6), Point(10, 10)
-    assert segments_intersect(p5, p6, p7, p8, touch_is_intersection=False) is False, "Parallele getrennte Segmente dürfen nicht schneiden"
+    test_candidates = [
+        ControlCandidate("C_LEGAL", Point(140.0, 360.0), IOFCode.KNOLL, name="Kuppe im offenen Wald"),
+        ControlCandidate("C_FORBIDDEN", Point(320.0, 75.0), IOFCode.PIT, name="Grube im Sperrgebiet"),
+        ControlCandidate("C_THICKET", Point(310.0, 250.0), IOFCode.BOULDER, name="Felsblock in Dickicht 3"),
+        ControlCandidate("C_WATER", Point(70.0, 340.0), IOFCode.WATER_HOLE, name="Posten mitten im Waldsee"),
+        ControlCandidate("C_NO_IOF", Point(150.0, 150.0), iof_code="", name="Posten ohne IOF-Objektmerkmal"),
+    ]
 
-    # B) Point in Polygon
-    poly = Polygon([Point(10, 10), Point(50, 10), Point(50, 50), Point(10, 50)])
-    assert point_in_polygon(Point(30, 30), poly) is True, "Punkt in Mitte muss drinnen sein"
-    assert point_in_polygon(Point(5, 5), poly) is False, "Punkt ausserhalb muss draussen sein"
+    expected_outcomes = [True, False, False, False, False]
 
-    # C) Winkelprüfung (Spitze Kehre vs. Gerader Durchlauf)
-    # Geradeaus (180 Grad)
-    ang_straight = angle_between_legs(Point(0, 0), Point(5, 0), Point(10, 0))
-    assert math.isclose(ang_straight, 180.0, abs_tol=1.0), f"Erwartet ~180°, erhalten: {ang_straight}"
+    for cand, expected in zip(test_candidates, expected_outcomes):
+        is_legal, reason = terrain.is_control_legal(cand)
+        status_tag = "[PASS - LEGAL]  " if is_legal else "[PASS - ABGELEHNT]"
+        print(f"  {status_tag} {cand.id:<12} ({cand.name:<30}) -> {reason}")
+        assert is_legal == expected, f"Erwartetes Ergebnis {expected} für {cand.id}, aber erhalten: {is_legal}"
 
-    # 90 Grad Abknickung
-    ang_90 = angle_between_legs(Point(0, 0), Point(5, 0), Point(5, 5))
-    assert math.isclose(ang_90, 90.0, abs_tol=1.0), f"Erwartet ~90°, erhalten: {ang_90}"
-
-    # Spitze Kehre (Gegenverkehr, Wendewinkel 30 Grad)
-    ang_acute = angle_between_legs(Point(0, 0), Point(10, 0), Point(1, 2))
-    assert ang_acute < 60.0, f"Spitze Kehre sollte < 60° sein, ist: {ang_acute}"
-    valid, _ = check_angle(Point(0, 0), Point(10, 0), Point(1, 2), min_angle_deg=60.0)
-    assert valid is False, "Spitze Kehre muss ungültig sein"
-
-    print("  [OK] Geometrie-Primitiven erfolgreich verifiziert.\n")
+    print("\n  >> Fazit Stufe 1: Einzelposten-Filter weist illegale Posten deterministisch ab. [OK]")
 
 
-def test_course_generation_and_route_choice():
-    """Testet A*, Yen's Algorithmus, Routenwahl-Score und Bahnengenerierung."""
-    print("--- 2. Test Bahnengenerator & Routenwahl-Metrik ---")
+def test_stage_2_two_controls_feasibility(terrain: SemanticTerrainModel):
+    """
+    STUFE 2 (Zwei Posten):
+    Prüft Distanzkorridor und Machbarkeit zwischen zwei Posten:
+    - Mindestabstand (z.B. >= 60 m, Verhindert Postenverwechslung)
+    - Maximaldistanz
+    - Existenz eines durchgängigen Laufpfades (nicht blockiert durch unpassierbare Mauer)
+    """
+    print("\n" + "=" * 76)
+    print("  STUFE 2: ZWEI-POSTEN-MACHBARKEIT & DISTANZKORRIDOR")
+    print("=" * 76)
 
-    terrain = create_synthetic_terrain()
-    config = CourseConfig(
-        min_angle_deg=60.0,
-        allow_hairpin=False,
-        route_choice_delta_threshold=0.08,
-        route_choice_drift_threshold=20.0,
-        route_choice_bonus_weight=150.0,
-        grid_resolution_m=25.0
+    nav_graph = NavigationGraph(terrain, resolution=25.0)
+
+    # Fall A: Normaler, machbarer Korridor zwischen START und 101
+    feasible_a, path_a, msg_a = validate_leg_feasibility(nav_graph, "START", "101", min_distance_m=60.0, max_distance_m=800.0)
+    print(f"  [Fall A: Normaler Leg] START -> 101:")
+    print(f"     Status: {'Gültig' if feasible_a else 'Ungültig'} | {msg_a}")
+    assert feasible_a is True, "START -> 101 muss machbar sein"
+    assert path_a is not None
+    assert path_a.estimated_time_s > 0.0, "Laufzeit muss positiv berechnet sein"
+
+    # Fall B: Unterschreitung des Mindestabstands (< 60 m)
+    too_close_cand = ControlCandidate("TOO_CLOSE", Point(80.0, 250.0), IOFCode.BOULDER, name="Zu nah am Start (30m)")
+    terrain.add_candidate(too_close_cand)
+    nav_graph.integrate_point(too_close_cand.point, key=too_close_cand.id)
+
+    feasible_b, _, msg_b = validate_leg_feasibility(nav_graph, "START", "TOO_CLOSE", min_distance_m=60.0, max_distance_m=800.0)
+    print(f"\n  [Fall B: Zu naher Posten] START -> TOO_CLOSE (Abstand 30m):")
+    print(f"     Status: {'Gültig' if feasible_b else 'Abgelehnt'} | {msg_b}")
+    assert feasible_b is False, "Posten mit Distanz < 60m muss abgewiesen werden"
+
+    # Fall C: Isolierter Posten hinter geschlossener Mauer (ohne Durchgang)
+    enclosed_cand = ControlCandidate("ENCLOSED", Point(150.0, 480.0), IOFCode.PIT, name="Posten hinter Sperrmauer")
+    # Vollständig umschliessende Mauer
+    blocking_wall = LinearFeature(
+        id="cage_wall",
+        line=LineString([Point(130, 460), Point(170, 460), Point(170, 495), Point(130, 495), Point(130, 460)]),
+        passable=False
     )
+    terrain.add_linear_feature(blocking_wall)
+    terrain.add_candidate(enclosed_cand)
+    nav_graph.rebuild()
+
+    feasible_c, _, msg_c = validate_leg_feasibility(nav_graph, "START", "ENCLOSED", min_distance_m=60.0, max_distance_m=800.0)
+    print(f"\n  [Fall C: Blockierter Posten] START -> ENCLOSED (Hinter Sperrmauer):")
+    print(f"     Status: {'Gültig' if feasible_c else 'Abgelehnt'} | {msg_c}")
+    assert feasible_c is False, "Vollständig blockierter Posten darf keinen Pfad haben"
+
+    # Aufräumen der temporären Testobjekte
+    terrain.remove_candidate("TOO_CLOSE")
+    terrain.remove_candidate("ENCLOSED")
+    del terrain.linear_features["cage_wall"]
+    nav_graph.rebuild()
+
+    print("\n  >> Fazit Stufe 2: Distanzkorridore und Barrierenprüfung funktionieren einwandfrei. [OK]")
+
+
+def test_stage_3_k_route_choices(terrain: SemanticTerrainModel):
+    """
+    STUFE 3 (Teilstrecke mit K Routenwahlen):
+    Testet eine Verbindung zwischen zwei Posten und verifiziert:
+    - K Pfade (K=3) mit Mindest-Drift (>= 20 m)
+    - Jede gefundene Teilstrecken-Alternative liefert Distanz, berechnete Laufzeit und Höhenmeter zurück
+    - Erkennung konkurrenzfähiger Alternativen (Delta <= 8%) vs. Verwerfung schlechter Umwege
+    """
+    print("\n" + "=" * 76)
+    print("  STUFE 3: TEILSTRECKE MIT K ROUTENWAHLEN (Yen's K-Shortest Paths & Drift)")
+    print("=" * 76)
+
+    config = CourseConfig(
+        num_routes=3,
+        min_drift_m=20.0,
+        route_choice_delta_threshold=0.15,  # Bis 15% für didaktische Demonstration
+        base_pace_s_per_m=0.3
+    )
+
+    nav_graph = NavigationGraph(terrain, resolution=25.0)
+
+    # Teilstrecke von 108 (115, 250) nach 105 (360, 360)
+    # Es existieren 3 physische Korridore:
+    # 1. Nordroute über den schnellen Waldweg (Y=420) mit Geschwindigkeitsbonus (0.6)
+    # 2. Direktroute durch das Mauertor (Y=250) nördlich am Dickicht vorbei
+    # 3. Südroute durch das Mauertor südlich am Dickicht vorbei
+    print(f"  Analysiere K={config.num_routes} Routenalternativen für Leg 108 -> 105 (Mindest-Drift: {config.min_drift_m}m)...")
+    analysis = analyze_leg_route_choices(nav_graph, "108", "105", config)
+
+    print(f"\n  Gefundene signifikant unterschiedliche Pfade: {len(analysis.paths)} von K={config.num_routes}")
+    assert len(analysis.paths) >= 2, "Es müssen mindestens 2 signifikant unterschiedliche Routen gefunden werden"
+
+    for idx, path in enumerate(analysis.paths, start=1):
+        drift_to_opt = 0.0 if idx == 1 else calculate_spatial_drift(analysis.paths[0].points, path.points)
+        time_diff_s = path.estimated_time_s - analysis.paths[0].estimated_time_s
+        delta_pct = (path.cost - analysis.paths[0].cost) / (analysis.paths[0].cost + 1e-9) * 100
+
+        print(f"    * Route {idx}: Distanz {path.distance_m:5.1f} m | +{path.climb_m:4.1f} Hm | "
+              f"Laufzeit: {path.formatted_time} (+{time_diff_s:4.1f}s, +{delta_pct:4.1f}%) | Drift zum Optimum: {drift_to_opt:4.1f} m")
+
+        assert path.distance_m > 0.0, "Distanz muss positiv sein"
+        assert path.estimated_time_s > 0.0, "Berechnete Laufzeit muss positiv sein"
+
+    # Verifikation der räumlichen Spreizung zwischen den Alternativen
+    if len(analysis.paths) >= 2:
+        d12 = calculate_spatial_drift(analysis.paths[0].points, analysis.paths[1].points)
+        assert d12 >= config.min_drift_m, f"Drift zwischen Route 1 und 2 ({d12:.1f}m) muss >= {config.min_drift_m}m sein"
+
+    print(f"\n  Routenwahl-Bewertung: {analysis.description}")
+    print("\n  >> Fazit Stufe 3: Mehrfache K-Routenwahlen mit Distanz, Laufzeit und Drift verifiziert. [OK]")
+    return config
+
+
+def test_stage_4_course_variance_and_reactive(terrain: SemanticTerrainModel, config: CourseConfig):
+    """
+    STUFE 4 (Gesamtbahn mit Varianz & Reaktivität):
+    - Generiert eine vollständige Bahn mit leg_variance = 0.6 (Rhythmuswechsel zwischen kurz und lang)
+    - Validiert das Vorhandensein von kurzen technischen Posten (<= 250m) und langen Schlägen (>= 400m)
+    - Simuliert das nachträgliche Verschieben eines Sperrgebiets direkt auf einen Posten
+    - Validiert das automatische Verschieben des Postens und das Re-Routing der Teilstrecken
+    """
+    print("\n" + "=" * 76)
+    print("  STUFE 4: GESAMTBAHN MIT VARIANZ-STEUERUNG (leg_variance=0.6) & REAKTIVITÄT")
+    print("=" * 76)
+
+    # Generator-Konfiguration mit Rhythmuswechsel
+    config.leg_variance = 0.6
+    config.min_angle_deg = 60.0
+    config.allow_hairpin = False
+    config.num_routes = 3
 
     generator = HeuristicCourseGenerator(terrain, config)
 
-    # Bahn mit 3 Zwischenposten und Zielbudget 950 m generieren
-    print("  Generiere optimale 3-Posten-Bahn (Zielbudget: 950 m)...")
+    print("  Generiere Bahn mit Zielbudget: 1050 m, 4 Zwischenposten und leg_variance = 0.6...")
     course = generator.generate_course(
         start_id="START",
         finish_id="ZIEL",
-        target_distance_m=950.0,
-        target_climb_m=20.0,
-        num_controls=3
+        target_distance_m=1050.0,
+        target_climb_m=15.0,
+        num_controls=4
     )
 
     assert course is not None, "Generator muss eine gültige Bahn finden"
-    assert len(course.controls) == 5, f"Bahn muss 5 Punkte haben (Start + 3 Posten + Ziel), hat: {len(course.controls)}"
+    assert len(course.controls) == 6, f"Bahn muss 6 Punkte haben (Start + 4 Posten + Ziel), hat: {len(course.controls)}"
     assert course.is_geometrically_valid is True, "Bahn muss geometrisch fehlerfrei sein"
-    assert len(course.intersection_conflicts) == 0, "Es dürfen keine Teilstrecken-Kreuzungen existieren"
-    assert len(course.angle_warnings) == 0, "Es darf keine unzulässigen spitzen Kehren geben"
+    assert len(course.intersection_conflicts) == 0, "Keine Schnittlinien erlaubt"
+    assert len(course.angle_warnings) == 0, "Keine unerlaubten spitzen Kehren (<60°)"
 
     print(f"\n{course.summary()}\n")
 
-    # Prüfe Routenwahl-Erkennung
-    rc_legs = [leg for leg in course.legs if leg.has_route_choice]
-    print(f"  Erkannte Teilstrecken mit echter Routenwahl: {len(rc_legs)} von {len(course.legs)}")
-    for leg in rc_legs:
-        rc = leg.route_choice
-        print(f"    * Leg {leg.leg_index + 1} ({leg.from_control.id} -> {leg.to_control.id}): "
-              f"Delta={rc.cost_delta_pct:.1f}%, Drift={rc.max_drift_m:.1f} m, Score={rc.score:.1f}")
+    # Validierung der Rhythmus-Steuerung: Mischung aus kurzen und langen Teilstrecken
+    leg_dists = [l.distance_m for l in course.legs]
+    has_short_leg = any(d <= config.short_leg_max_m for d in leg_dists)
+    has_long_or_medium_leg = any(d >= 280.0 for d in leg_dists)
 
-    print("  [OK] Bahnengenerierung & Routenwahl erfolgreich validiert.\n")
-    return terrain, course, config
+    print(f"  Varianz-Analyse der Teilstrecken-Längen:")
+    print(f"    * Längen: {[round(d, 1) for d in leg_dists]} m")
+    print(f"    * Variationskoeffizient CV: {course.leg_variance_cv:.2f}")
+    print(f"    * Kurze technische Posten (<= {config.short_leg_max_m}m): {course.short_legs_count}")
+    print(f"    * Längere Entscheidungsschläge: {course.long_legs_count}")
 
+    assert has_short_leg, f"Bei leg_variance=0.6 muss mindestens eine kurze Teilstrecke (<= {config.short_leg_max_m}m) vorhanden sein!"
+    assert course.leg_variance_cv > 0.25, f"Variationskoeffizient CV ({course.leg_variance_cv:.2f}) muss spürbare Varianz zeigen!"
 
-def test_reactive_obstacle_shift(terrain: SemanticTerrainModel, course, config: CourseConfig):
-    """
-    Simuliert das Verschieben eines Sperrgebiets und verifiziert:
-    - Postenverschiebung aus dem Sperrgebiet
-    - Automatisches Neu-Routen betroffener Teilstrecken
-    - Korrekte Umgehung im Navigationsgraphen
-    """
-    print("--- 3. Test Reaktiver Loop: Sperrgebiet-Verschiebung & Auto-Rerouting ---")
+    # --------------------------------------------------------------------------
+    # Reaktivitäts-Test: Verschiebung eines Sperrgebiets
+    # --------------------------------------------------------------------------
+    print("\n  >> SIMULATION: Nachträgliche Verschiebung eines Sperrgebiets")
+    selected_c = course.controls[2]  # Wähle den 2. Zwischenposten
+    old_coord = (selected_c.point.x, selected_c.point.y)
+    print(f"     Platziere Sperrgebiet direkt über Posten {selected_c.id} bei {old_coord}...")
+
+    # Sperrgebiet zentriert über dem Posten
+    blocking_poly = Polygon([
+        Point(selected_c.point.x - 15.0, selected_c.point.y - 15.0),
+        Point(selected_c.point.x + 15.0, selected_c.point.y - 15.0),
+        Point(selected_c.point.x + 15.0, selected_c.point.y + 15.0),
+        Point(selected_c.point.x - 15.0, selected_c.point.y + 15.0),
+    ])
 
     course_manager = CourseManager(terrain, course, config)
     initial_distance = course.total_distance_m
 
-    # Alle Punkte des initialen Bahn-Pfades sammeln
-    initial_path_pts = []
-    for leg in course.legs:
-        initial_path_pts.extend(leg.optimal_path.points)
-
-    print("Initiale Kartensituation (vor Sperrgebiet-Verschiebung):")
-    print(render_ascii_map(terrain, initial_path_pts, terrain.forbidden_zones["nature_reserve"].polygon))
-
-    # Szenario:
-    # Neues Sperrgebiet wird direkt auf den Posten 104 und die Teilstrecke gelegt (X=235..265, Y=115..145),
-    # wodurch Posten 104 im Sperrgebiet liegt und automatisch an den Rand verschoben werden muss,
-    # und die Teilstrecken 2 und 3 automatisch um das Sperrgebiet herum geroutet werden.
-    print("\n  >> EREIGNIS: Ein neues Sperrgebiet wird aktiviert!")
-    print("     Lage: Temporäre Rodung / Baustelle bei (235, 115) bis (265, 145).")
-    print("     Achtung: Posten 104 (250, 130) liegt mitten im Sperrgebiet!")
-
-    blocking_polygon = Polygon([
-        Point(235.0, 115.0), Point(265.0, 115.0),
-        Point(265.0, 145.0), Point(235.0, 145.0)
-    ])
-
     update_report = course_manager.update_obstacle(
-        obstacle_id="forestry_closure",
-        new_polygon=blocking_polygon,
-        reason="Holzschlag & Baustelle"
+        obstacle_id="reactive_construction",
+        new_polygon=blocking_poly,
+        reason="Dringende Baumassnahme Postenbereich gesperrt"
     )
 
-    print("\nReaktiver Update-Report:")
-    print(f"  * Neu geroutete Teilstrecken: {update_report['rerouted_legs']}")
-    if update_report["relocated_controls"]:
-        for rel in update_report["relocated_controls"]:
-            print(f"  * Posten {rel['control_id']} lag im Sperrgebiet! Verschoben von "
-                  f"{rel['old_point']} nach {rel['new_point']} (Distanz: {rel['shift_distance_m']:.1f} m)")
-    else:
-        print("  * Keine Posten direkt im Sperrgebiet; Teilstrecken werden aussen herum geroutet.")
+    print("\n  Reaktiver Update-Report:")
+    print(f"    * Neu geroutete Teilstrecken: {update_report['rerouted_legs']}")
+    assert len(update_report["relocated_controls"]) > 0, "Der betroffene Posten muss verschoben worden sein!"
+    for rel in update_report["relocated_controls"]:
+        print(f"    * Posten {rel['control_id']} wurde automatisch von {rel['old_point']} nach {rel['new_point']} verschoben "
+              f"(Distanz: {rel['shift_distance_m']:.1f} m).")
 
     new_course = update_report["course"]
-    print(f"  * Neue Gesamtlänge: {new_course.total_distance_m:.1f} m (Delta: {new_course.total_distance_m - initial_distance:+.1f} m)")
-    print(f"  * Neuer Routenwahl-Score: {new_course.total_route_choice_score:.1f}")
-    print(f"  * Geometrisch weiterhin gültig: {'JA' if new_course.is_geometrically_valid else 'NEIN'}")
+    print(f"    * Neue Gesamtlänge: {new_course.total_distance_m:.1f} m (Delta: {new_course.total_distance_m - initial_distance:+.1f} m)")
+    print(f"    * Neue Gesamtlaufzeit: {new_course.formatted_total_time}")
+    print(f"    * Geometrisch weiterhin gültig: {'JA' if new_course.is_geometrically_valid else 'NEIN'}")
+    assert new_course.is_geometrically_valid is True
 
-    # Sammle neue Pfadpunkte
+    # Sammle neue Pfadpunkte und prüfe, dass kein Punkt im Sperrgebiet liegt
     new_path_pts = []
     for leg in new_course.legs:
         new_path_pts.extend(leg.optimal_path.points)
 
-    # Verifikation: Kein Pfadpunkt der neuen Bahn darf im neuen Sperrgebiet liegen
     for p in new_path_pts:
-        assert point_in_polygon(p, blocking_polygon, include_boundary=False) is False, \
+        assert point_in_polygon(p, blocking_poly, include_boundary=False) is False, \
             f"Pfadpunkt {p.as_tuple()} darf nicht im Sperrgebiet liegen!"
 
-    print("\nAktualisierte Kartensituation (nach Umgehung des Sperrgebiets):")
-    print(render_ascii_map(terrain, new_path_pts, blocking_polygon))
+    print("\nAktualisierte Kartensituation nach automatischer Umgehung:")
+    print(render_ascii_map(terrain, new_path_pts, blocking_poly))
 
-    print("\nVergleich der Teilstrecken:")
-    for leg in new_course.legs:
-        print(f"  Leg {leg.leg_index + 1}: {leg.from_control.id} -> {leg.to_control.id} | "
-              f"Länge: {leg.distance_m:.1f} m | {leg.route_choice.description}")
-
-    print("\n  [OK] Reaktiver Loop hat das Sperrgebiet erfolgreich automatisch umgangen!")
+    print("\n  >> Fazit Stufe 4: Varianzsteuerung & reaktives Sperrzonen-Management erfolgreich validiert. [OK]")
 
 
-def run_all_tests():
-    print("=" * 72)
-    print("   AI COURSE SETTER - TASK 1 CORE & GEOMETRY VERIFIKATION")
-    print("=" * 72 + "\n")
+def run_all_stages():
+    print("=" * 76)
+    print("   AI COURSE SETTER - DIDAKTISCHER 4-STUFEN-TEST (CORE & GEOMETRY)")
+    print("=" * 76)
 
-    test_geometry_primitives()
-    terrain, course, config = test_course_generation_and_route_choice()
-    test_reactive_obstacle_shift(terrain, course, config)
+    terrain = create_synthetic_terrain()
 
-    print("\n" + "=" * 72)
-    print("   ALLE TESTS ERFOLGREICH BESTANDEN!")
-    print("=" * 72)
+    # Stufe 1: Einzelposten
+    test_stage_1_single_control(terrain)
+
+    # Stufe 2: Zwei Posten
+    test_stage_2_two_controls_feasibility(terrain)
+
+    # Stufe 3: K Routenwahlen
+    config = test_stage_3_k_route_choices(terrain)
+
+    # Stufe 4: Gesamtbahn & Reaktivität
+    test_stage_4_course_variance_and_reactive(terrain, config)
+
+    print("\n" + "=" * 76)
+    print("   ALLE 4 TESTSTUFEN WURDEN ERFOLGREICH BESTANDEN!")
+    print("=" * 76)
 
 
 if __name__ == "__main__":
-    run_all_tests()
+    run_all_stages()

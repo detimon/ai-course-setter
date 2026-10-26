@@ -35,34 +35,68 @@ from terrain_model import (
 @dataclass
 class CourseConfig:
     """Konfigurierbare Parameter der Bahnsetzer-Engine."""
-    # Winkelprüfung
+    # K-Routenwahlen
+    num_routes: int = 3                       # K-kürzeste Pfade (1 bis 5, Default: 3)
+    min_drift_m: float = 20.0                 # Mindest-Drift (Meter) zwischen alternativen Routen
+    route_choice_delta_threshold: float = 0.08# Maximale Zeit-/Kostendifferenz (8%) für echte Alternativen
+    route_choice_bonus_weight: float = 150.0  # Bonus im Gesamt-Score für Teilstrecken mit Routenwahl
+    base_pace_s_per_m: float = 0.3            # Basis-Lauftempo: 0.3 s/m = 5:00 min/km in flachem Wald
+
+    # Rhythmus- / Varianz-Steuerung
+    leg_variance: float = 0.5                 # 0.0 = gleichmässig, > 0.4 = Rhythmuswechsel (kurz/lang)
+    short_leg_max_m: float = 250.0            # Schwelle für kurze technische Posten
+    long_leg_min_m: float = 400.0             # Schwelle für lange Entscheidungsschläge
+
+    # Geometrie-Filter
     min_angle_deg: float = 60.0               # Mindestwinkel am Posten (zur Vermeidung von Gegenverkehr)
     allow_hairpin: bool = False               # Erlaube spitze Kehren (< min_angle_deg)
-    
-    # Routenwahl-Analyse
-    k_shortest_paths: int = 3                 # Anzahl der zu prüfenden K-kürzesten Pfade (Yen)
-    route_choice_delta_threshold: float = 0.08# Maximale Zeit-/Kostendifferenz (8%) für echte Alternativen
-    route_choice_drift_threshold: float = 25.0# Minimale räumliche Spreizung (Meter) zweier Pfade
-    route_choice_bonus_weight: float = 150.0  # Bonus im Gesamt-Score für Teilstrecken mit Routenwahl
-    
-    # Strafen & Gewichte
     intersection_penalty: float = 5000.0      # Strafe bei sich kreuzenden Teilstrecken
     hairpin_penalty: float = 2000.0           # Strafe bei zu spitzem Wendewinkel
+
+    # Zielbudget-Gewichte
     length_weight: float = 1.0                # Gewichtung der Längenabweichung
     climb_weight: float = 10.0                # Gewichtung der Höhenmeterabweichung (1 Hm = 10m Distanz)
-    
+
     # Graph-Auflösung
     grid_resolution_m: float = 25.0           # Rasterauflösung für den Navigationsgraphen
     diagonal_connections: bool = True         # 8-Nachbarschaft im Raster
 
+    @property
+    def k_shortest_paths(self) -> int:
+        return self.num_routes
+
+    @k_shortest_paths.setter
+    def k_shortest_paths(self, val: int) -> None:
+        self.num_routes = val
+
+    @property
+    def k_paths(self) -> int:
+        return self.num_routes
+
+    @k_paths.setter
+    def k_paths(self, val: int) -> None:
+        self.num_routes = val
+
+    @property
+    def route_choice_drift_threshold(self) -> float:
+        return self.min_drift_m
+
+    @route_choice_drift_threshold.setter
+    def route_choice_drift_threshold(self, val: float) -> None:
+        self.min_drift_m = val
+
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "num_routes": self.num_routes,
+            "min_drift_m": self.min_drift_m,
+            "route_choice_delta_threshold": self.route_choice_delta_threshold,
+            "route_choice_bonus_weight": self.route_choice_bonus_weight,
+            "base_pace_s_per_m": self.base_pace_s_per_m,
+            "leg_variance": self.leg_variance,
+            "short_leg_max_m": self.short_leg_max_m,
+            "long_leg_min_m": self.long_leg_min_m,
             "min_angle_deg": self.min_angle_deg,
             "allow_hairpin": self.allow_hairpin,
-            "k_shortest_paths": self.k_shortest_paths,
-            "route_choice_delta_threshold": self.route_choice_delta_threshold,
-            "route_choice_drift_threshold": self.route_choice_drift_threshold,
-            "route_choice_bonus_weight": self.route_choice_bonus_weight,
             "intersection_penalty": self.intersection_penalty,
             "hairpin_penalty": self.hairpin_penalty,
             "length_weight": self.length_weight,
@@ -73,7 +107,14 @@ class CourseConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> CourseConfig:
-        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        d = dict(data)
+        if "k_shortest_paths" in d and "num_routes" not in d:
+            d["num_routes"] = d.pop("k_shortest_paths")
+        if "k_paths" in d and "num_routes" not in d:
+            d["num_routes"] = d.pop("k_paths")
+        if "route_choice_drift_threshold" in d and "min_drift_m" not in d:
+            d["min_drift_m"] = d.pop("route_choice_drift_threshold")
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 # ==============================================================================
@@ -88,6 +129,17 @@ class PathResult:
     distance_m: float
     climb_m: float
     effective_friction: float = 1.0
+    estimated_time_s: float = 0.0
+
+    @property
+    def formatted_time(self) -> str:
+        minutes = int(self.estimated_time_s // 60)
+        seconds = int(round(self.estimated_time_s % 60))
+        return f"{minutes:02d}:{seconds:02d} min"
+
+    @property
+    def time_seconds(self) -> float:
+        return self.estimated_time_s
 
 
 class NavigationGraph:
@@ -315,44 +367,54 @@ def yens_k_shortest_paths(
     graph: NavigationGraph,
     start_key: str,
     goal_key: str,
-    K: int = 3
+    K: int = 3,
+    min_drift_m: float = 20.0,
+    base_pace_s_per_m: float = 0.3,
+    max_search_iterations: int = 40
 ) -> List[PathResult]:
     """
-    Yen's Algorithmus zur Berechnung der K-kürzesten schleifenfreien Pfade.
-    Garantiert deterministische und optimale Alternativrouten.
+    Yen's Algorithmus zur Berechnung von bis zu K signifikant unterschiedlichen,
+    schleifenfreien Pfaden (mit Mindest-Drift >= min_drift_m).
+    Garantiert deterministische und physisch distinkte Alternativrouten.
     """
     first_path = a_star_search(graph, start_key, goal_key)
     if not first_path:
         return []
 
-    # A speichert die gefundenen K-kürzesten Pfade
+    first_path.estimated_time_s = first_path.cost * base_pace_s_per_m
+
+    # A speichert die gefundenen K-kürzesten, räumlich distinkten Pfade
     A: List[PathResult] = [first_path]
-    # B speichert Pfadkandidaten (Prioritätswarteschlange)
+    # B speichert Pfadkandidaten (Prioritätswarteschlange: (cost, counter, path))
     B: List[Tuple[float, int, PathResult]] = []
     seen_paths: Set[str] = {_path_signature(first_path.points)}
     counter = 0
 
-    for k in range(1, K):
-        prev_path = A[k - 1].points
-        # Wandle Pfadpunkte in Node-Keys um
-        prev_keys = [_find_matching_key(graph, p) for p in prev_path]
-        if any(key is None for key in prev_keys):
-            break
+    # Liste aller explorierter Pfade (Basis für Yen's Spur-Verzweigungen)
+    explored_paths: List[PathResult] = [first_path]
+    explored_idx = 0
 
-        # Der Spur-Knoten wandert von 0 bis zur vorletzten Position
-        for i in range(len(prev_keys) - 1):
-            spur_node_key = prev_keys[i]
-            root_path_keys = prev_keys[:i + 1]
-            root_path_pts = prev_path[:i + 1]
+    while len(A) < K and explored_idx < len(explored_paths) and counter < max_search_iterations:
+        curr_path = explored_paths[explored_idx].points
+        explored_idx += 1
+
+        curr_keys = [_find_matching_key(graph, p) for p in curr_path]
+        if any(key is None for key in curr_keys):
+            continue
+
+        for i in range(len(curr_keys) - 1):
+            spur_node_key = curr_keys[i]
+            root_path_keys = curr_keys[:i + 1]
+            root_path_pts = curr_path[:i + 1]
 
             # 1. Kanten ausschliessen, die von vorherigen Pfaden mit identischem Root-Pfad genutzt wurden
             excluded_edges: Set[Tuple[str, str]] = set()
-            for p in A:
+            for p in explored_paths:
                 p_keys = [_find_matching_key(graph, pt) for pt in p.points]
                 if len(p_keys) > i and p_keys[:i + 1] == root_path_keys:
                     excluded_edges.add((p_keys[i], p_keys[i + 1]))
 
-            # 2. Knoten des Root-Pfads (ausser dem Spur-Knoten selbst) ausschliessen, um Schleifen zu verhindern
+            # 2. Knoten des Root-Pfads ausschliessen (ausser Spur-Knoten)
             excluded_nodes = set(root_path_keys[:-1])
 
             # 3. Spur-Pfad von Spur-Knoten zum Ziel berechnen
@@ -363,13 +425,11 @@ def yens_k_shortest_paths(
             )
 
             if spur_result:
-                # Gesamten Pfad zusammensetzen
                 total_pts = root_path_pts[:-1] + spur_result.points
                 sig = _path_signature(total_pts)
                 if sig not in seen_paths:
                     seen_paths.add(sig)
 
-                    # Kosten für den Root-Pfad berechnen
                     root_cost, root_dist, root_climb = _compute_path_metrics(graph.terrain, root_path_pts)
                     total_cost = root_cost + spur_result.cost
                     total_dist = root_dist + spur_result.distance_m
@@ -380,16 +440,28 @@ def yens_k_shortest_paths(
                         cost=total_cost,
                         distance_m=total_dist,
                         climb_m=total_climb,
-                        effective_friction=total_cost / (total_dist + 1e-9)
+                        effective_friction=total_cost / (total_dist + 1e-9),
+                        estimated_time_s=total_cost * base_pace_s_per_m
                     )
                     counter += 1
                     heapq.heappush(B, (total_cost, counter, candidate))
 
-        if not B:
-            break
+        # Nun Kandidaten aus B entnehmen und prüfen, ob sie Mindest-Drift zu bestehenden Pfaden in A haben
+        while B and len(A) < K:
+            _, _, candidate_p = heapq.heappop(B)
+            explored_paths.append(candidate_p)
 
-        _, _, best_candidate = heapq.heappop(B)
-        A.append(best_candidate)
+            if min_drift_m <= 0.0:
+                A.append(candidate_p)
+                break
+            else:
+                is_distinct = all(
+                    calculate_spatial_drift(candidate_p.points, accepted_p.points) >= min_drift_m
+                    for accepted_p in A
+                )
+                if is_distinct:
+                    A.append(candidate_p)
+                    break
 
     return A
 
@@ -466,58 +538,125 @@ def analyze_leg_route_choices(
 ) -> RouteChoiceAnalysis:
     """
     Analysiert, ob zwischen zwei Posten eine echte Routenwahlentscheidung vorliegt.
-    Bedingungen für echte Routenwahl:
-    1. Mindestens 2 alternative Pfade
-    2. Zeit-/Kostendifferenz Delta <= config.route_choice_delta_threshold (z.B. 8%)
-    3. Räumliche Spreizung (Drift) >= config.route_choice_drift_threshold (z.B. 25 m)
+    Untersucht bis zu K alternative Pfade (Yen's K-Shortest Paths).
+    Kriterien für echte Routenwahl:
+    - Mindestens 2 physisch distinkte Pfade (Drift >= min_drift_m)
+    - Zeit-/Kostendifferenz Delta <= route_choice_delta_threshold (z.B. 8%)
     """
     cfg = config or CourseConfig()
-    paths = yens_k_shortest_paths(graph, start_key, goal_key, K=cfg.k_shortest_paths)
+    paths = yens_k_shortest_paths(
+        graph, start_key, goal_key,
+        K=cfg.num_routes,
+        min_drift_m=cfg.min_drift_m,
+        base_pace_s_per_m=cfg.base_pace_s_per_m
+    )
 
-    if len(paths) < 2:
-        cost = paths[0].cost if paths else 0.0
+    if not paths:
         return RouteChoiceAnalysis(
             has_route_choice=False,
             score=0.0,
-            best_cost=cost,
-            alt_cost=cost,
+            best_cost=0.0,
+            alt_cost=0.0,
             cost_delta_pct=0.0,
             max_drift_m=0.0,
-            paths=paths,
-            description="Nur ein dominanter Pfad vorhanden."
+            paths=[],
+            description="Kein passierbarer Pfad gefunden."
         )
 
     best_p = paths[0]
-    alt_p = paths[1]
+    if len(paths) == 1:
+        return RouteChoiceAnalysis(
+            has_route_choice=False,
+            score=0.0,
+            best_cost=best_p.cost,
+            alt_cost=best_p.cost,
+            cost_delta_pct=0.0,
+            max_drift_m=0.0,
+            paths=paths,
+            description="Nur ein einziger signifikanter Pfad vorhanden."
+        )
 
-    delta = (alt_p.cost - best_p.cost) / (best_p.cost + 1e-9)
-    drift = calculate_spatial_drift(best_p.points, alt_p.points)
+    competitive_alts = []
+    total_score = 0.0
+    alt_summaries = []
 
-    has_rc = (delta <= cfg.route_choice_delta_threshold) and (drift >= cfg.route_choice_drift_threshold)
+    for idx, alt_p in enumerate(paths[1:], start=1):
+        delta = (alt_p.cost - best_p.cost) / (best_p.cost + 1e-9)
+        drift = calculate_spatial_drift(best_p.points, alt_p.points)
+        time_diff_s = alt_p.estimated_time_s - best_p.estimated_time_s
 
-    score = 0.0
-    if has_rc:
-        # Je kleiner die Zeitdifferenz (max. 8%) und je deutlicher der Drift (bis zu 60m), desto höher der Score
-        closeness_factor = max(0.0, 1.0 - (delta / cfg.route_choice_delta_threshold))
-        drift_factor = min(1.0, drift / 50.0)
-        score = cfg.route_choice_bonus_weight * (0.6 * closeness_factor + 0.4 * drift_factor)
-        desc = f"Echte Routenwahl! Delta: {delta * 100:.1f}%, Drift: {drift:.1f} m"
-    else:
-        if delta > cfg.route_choice_delta_threshold:
-            desc = f"Keine Routenwahl: Alternative um {delta * 100:.1f}% zu langsam."
+        is_competitive = (delta <= cfg.route_choice_delta_threshold) and (drift >= cfg.min_drift_m)
+        if is_competitive:
+            closeness_factor = max(0.0, 1.0 - (delta / cfg.route_choice_delta_threshold))
+            drift_factor = min(1.0, drift / 50.0)
+            alt_score = cfg.route_choice_bonus_weight * (0.6 * closeness_factor + 0.4 * drift_factor)
+            total_score += alt_score
+            competitive_alts.append((idx, delta, drift, alt_p))
+            alt_summaries.append(
+                f"Alt {idx}: +{time_diff_s:.1f}s ({delta * 100:.1f}%), Drift {drift:.1f}m [Echte Wahl]"
+            )
         else:
-            desc = f"Keine Routenwahl: Pfade laufen fast parallel (Drift: {drift:.1f} m < {cfg.route_choice_drift_threshold} m)."
+            if delta > cfg.route_choice_delta_threshold:
+                reason = f"zu langsam (+{delta * 100:.1f}% > {cfg.route_choice_delta_threshold * 100:.0f}%)"
+            else:
+                reason = f"zu geringer Drift ({drift:.1f}m < {cfg.min_drift_m:.1f}m)"
+            alt_summaries.append(
+                f"Alt {idx}: +{time_diff_s:.1f}s ({delta * 100:.1f}%), Drift {drift:.1f}m [{reason}]"
+            )
+
+    has_rc = len(competitive_alts) > 0
+    first_alt = paths[1]
+    first_delta = (first_alt.cost - best_p.cost) / (best_p.cost + 1e-9)
+    first_drift = calculate_spatial_drift(best_p.points, first_alt.points)
+
+    if has_rc:
+        desc = f"Echte Routenwahl mit {len(competitive_alts)} konkurrenzfähigen Alternative(n)! " + "; ".join(alt_summaries)
+    else:
+        desc = f"Keine echte Routenwahl: " + "; ".join(alt_summaries)
 
     return RouteChoiceAnalysis(
         has_route_choice=has_rc,
-        score=score,
+        score=total_score,
         best_cost=best_p.cost,
-        alt_cost=alt_p.cost,
-        cost_delta_pct=delta * 100,
-        max_drift_m=drift,
+        alt_cost=first_alt.cost,
+        cost_delta_pct=first_delta * 100,
+        max_drift_m=first_drift,
         paths=paths,
         description=desc
     )
+
+
+def validate_leg_feasibility(
+    graph: NavigationGraph,
+    from_id: str,
+    to_id: str,
+    min_distance_m: float = 60.0,
+    max_distance_m: float = 1500.0,
+    config: Optional[CourseConfig] = None
+) -> Tuple[bool, Optional[PathResult], str]:
+    """
+    Prüft Distanzkorridor und Machbarkeit zwischen zwei Posten (Stufe 2).
+    - Luftlinie im zulässigen Intervall [min_distance_m, max_distance_m]
+    - Durchgängiger Laufpfad ohne Blockaden durch unpassierbare Mauern oder Sperrzonen
+    """
+    c1 = graph.terrain.get_candidate(from_id)
+    c2 = graph.terrain.get_candidate(to_id)
+    if not c1 or not c2:
+        return (False, None, f"Posten '{from_id}' oder '{to_id}' nicht im Gelände gefunden.")
+
+    air_dist = c1.point.distance_to(c2.point)
+    if air_dist < min_distance_m:
+        return (False, None, f"Distanzfehler: Postenabstand {air_dist:.1f} m unterschreitet Mindestabstand ({min_distance_m:.1f} m).")
+    if air_dist > max_distance_m:
+        return (False, None, f"Distanzfehler: Postenabstand {air_dist:.1f} m überschreitet Maximaldistanz ({max_distance_m:.1f} m).")
+
+    cfg = config or CourseConfig()
+    path = a_star_search(graph, from_id, to_id)
+    if not path:
+        return (False, None, f"Machbarkeitsfehler: Kein passierbarer Pfad zwischen {from_id} und {to_id} (blockiert durch Mauer oder Sperrgebiet).")
+
+    path.estimated_time_s = path.cost * cfg.base_pace_s_per_m
+    return (True, path, f"Machbar: Reale Laufdistanz {path.distance_m:.1f} m, +{path.climb_m:.1f} Hm, Laufzeit {path.formatted_time}.")
 
 
 def check_intersections(controls: List[ControlCandidate]) -> List[Tuple[int, int]]:
@@ -578,10 +717,17 @@ class CourseLeg:
     distance_m: float
     climb_m: float
     cost: float
+    estimated_time_s: float = 0.0
 
     @property
     def has_route_choice(self) -> bool:
         return self.route_choice.has_route_choice
+
+    @property
+    def formatted_time(self) -> str:
+        minutes = int(self.estimated_time_s // 60)
+        seconds = int(round(self.estimated_time_s % 60))
+        return f"{minutes:02d}:{seconds:02d} min"
 
 
 @dataclass
@@ -595,12 +741,23 @@ class Course:
     is_geometrically_valid: bool
     intersection_conflicts: List[Tuple[int, int]] = field(default_factory=list)
     angle_warnings: List[str] = field(default_factory=list)
+    total_time_s: float = 0.0
+    leg_variance_cv: float = 0.0
+    short_legs_count: int = 0
+    long_legs_count: int = 0
+
+    @property
+    def formatted_total_time(self) -> str:
+        minutes = int(self.total_time_s // 60)
+        seconds = int(round(self.total_time_s % 60))
+        return f"{minutes:02d}:{seconds:02d} min"
 
     def summary(self) -> str:
         s = [
             f"=== BAHN-ZUSAMMENFASSUNG ===",
             f"Posten: {len(self.controls)} (Start -> {' -> '.join(c.id for c in self.controls[1:-1])} -> Ziel)",
-            f"Gesamtlänge: {self.total_distance_m:.1f} m | Höhenmeter: {self.total_climb_m:.1f} Hm",
+            f"Gesamtlänge: {self.total_distance_m:.1f} m | Höhenmeter: {self.total_climb_m:.1f} Hm | Laufzeit: {self.formatted_total_time}",
+            f"Rhythmus/Varianz: CV={self.leg_variance_cv:.2f} (Kurze Posten <={250}m: {self.short_legs_count}, Lange Schläge >={400}m: {self.long_legs_count})",
             f"Routenwahl-Score: {self.total_route_choice_score:.1f}",
             f"Geometrisch gültig: {'JA' if self.is_geometrically_valid else 'NEIN (Konflikte vorhanden)'}",
         ]
@@ -614,7 +771,7 @@ class Course:
             rc_sym = "[RC]" if leg.has_route_choice else "    "
             s.append(
                 f"  {rc_sym} Leg {leg.leg_index + 1}: {leg.from_control.id} -> {leg.to_control.id} | "
-                f"{leg.distance_m:.1f} m, +{leg.climb_m:.1f} Hm | {leg.route_choice.description}"
+                f"{leg.distance_m:.1f} m, +{leg.climb_m:.1f} Hm, {leg.formatted_time} | {leg.route_choice.description}"
             )
         return "\n".join(s)
 
@@ -733,6 +890,7 @@ class HeuristicCourseGenerator:
         legs: List[CourseLeg] = []
         total_dist = 0.0
         total_climb = 0.0
+        total_time = 0.0
         total_rc_score = 0.0
 
         for i in range(len(controls) - 1):
@@ -744,7 +902,8 @@ class HeuristicCourseGenerator:
                 points=[c1.point, c2.point],
                 cost=c1.point.distance_to(c2.point),
                 distance_m=c1.point.distance_to(c2.point),
-                climb_m=0.0
+                climb_m=0.0,
+                estimated_time_s=c1.point.distance_to(c2.point) * self.config.base_pace_s_per_m
             )
 
             leg = CourseLeg(
@@ -755,25 +914,41 @@ class HeuristicCourseGenerator:
                 route_choice=rc_analysis,
                 distance_m=opt_path.distance_m,
                 climb_m=opt_path.climb_m,
-                cost=opt_path.cost
+                cost=opt_path.cost,
+                estimated_time_s=opt_path.estimated_time_s
             )
             legs.append(leg)
             total_dist += leg.distance_m
             total_climb += leg.climb_m
+            total_time += leg.estimated_time_s
             total_rc_score += rc_analysis.score
+
+        # Varianz- und Rhythmus-Kennzahlen
+        leg_dists = [l.distance_m for l in legs]
+        if len(leg_dists) > 1:
+            mean_d = sum(leg_dists) / len(leg_dists)
+            var_d = sum((d - mean_d) ** 2 for d in leg_dists) / len(leg_dists)
+            std_d = math.sqrt(var_d)
+            cv_d = std_d / (mean_d + 1e-9)
+        else:
+            cv_d = 0.0
+
+        short_count = sum(1 for d in leg_dists if d <= self.config.short_leg_max_m)
+        long_count = sum(1 for d in leg_dists if d >= self.config.long_leg_min_m)
 
         # Winkelwarnungen sammeln
         angle_warnings: List[str] = []
-        for i in range(1, len(controls) - 1):
-            is_valid, alpha = check_angle(
-                controls[i - 1].point, controls[i].point, controls[i + 1].point,
-                min_angle_deg=self.config.min_angle_deg,
-                allow_hairpin=self.config.allow_hairpin
-            )
-            if not is_valid:
-                angle_warnings.append(
-                    f"Spitze Kehre an Posten {controls[i].id}: Wendewinkel nur {alpha:.1f}° (< {self.config.min_angle_deg}°)"
+        if not self.config.allow_hairpin:
+            for i in range(1, len(controls) - 1):
+                is_valid, alpha = check_angle(
+                    controls[i - 1].point, controls[i].point, controls[i + 1].point,
+                    min_angle_deg=self.config.min_angle_deg,
+                    allow_hairpin=self.config.allow_hairpin
                 )
+                if not is_valid:
+                    angle_warnings.append(
+                        f"Spitze Kehre an Posten {controls[i].id}: Wendewinkel nur {alpha:.1f}° (< {self.config.min_angle_deg}°)"
+                    )
 
         conflicts = check_intersections(controls)
         is_geom_valid = (len(conflicts) == 0) and (len(angle_warnings) == 0)
@@ -786,7 +961,11 @@ class HeuristicCourseGenerator:
             total_route_choice_score=total_rc_score,
             is_geometrically_valid=is_geom_valid,
             intersection_conflicts=conflicts,
-            angle_warnings=angle_warnings
+            angle_warnings=angle_warnings,
+            total_time_s=total_time,
+            leg_variance_cv=cv_d,
+            short_legs_count=short_count,
+            long_legs_count=long_count
         )
 
     def _calculate_fitness(self, course: Course, target_distance_m: float, target_climb_m: float) -> float:
@@ -800,6 +979,22 @@ class HeuristicCourseGenerator:
             + course.total_route_choice_score
         )
 
+        # Varianz- und Rhythmus-Steuerung (leg_variance: 0.0 bis 1.0)
+        # leg_variance == 0.0: möglichst gleichmässige Teilstrecken
+        # leg_variance > 0.4: bewusster Rhythmuswechsel (kurze Posten ca. 100-250m & lange Schläge ca. 400-900m)
+        if self.config.leg_variance <= 0.05:
+            fitness -= course.leg_variance_cv * 600.0
+        else:
+            target_cv = 0.2 + 0.6 * self.config.leg_variance
+            cv_diff = abs(course.leg_variance_cv - target_cv)
+            fitness += max(0.0, 1.0 - cv_diff / 0.5) * 150.0
+
+            if self.config.leg_variance >= 0.4:
+                if course.short_legs_count >= 1 and course.long_legs_count >= 1:
+                    fitness += 250.0 * self.config.leg_variance
+                elif course.short_legs_count >= 1 or course.long_legs_count >= 1:
+                    fitness += 80.0 * self.config.leg_variance
+
         # Qualitätsbonus der Posten
         cand_bonus = sum(c.quality_score * 20.0 for c in course.controls[1:-1])
         fitness += cand_bonus
@@ -807,7 +1002,7 @@ class HeuristicCourseGenerator:
         # Strafen für Geometriefehler
         if course.intersection_conflicts:
             fitness -= len(course.intersection_conflicts) * self.config.intersection_penalty
-        if course.angle_warnings:
+        if not self.config.allow_hairpin and course.angle_warnings:
             fitness -= len(course.angle_warnings) * self.config.hairpin_penalty
 
         return fitness
@@ -870,6 +1065,7 @@ class CourseManager:
         updated_legs: List[CourseLeg] = []
         total_dist = 0.0
         total_climb = 0.0
+        total_time = 0.0
         total_rc_score = 0.0
 
         for i in range(len(self.course.controls) - 1):
@@ -885,7 +1081,8 @@ class CourseManager:
                 points=[c1.point, c2.point],
                 cost=c1.point.distance_to(c2.point),
                 distance_m=c1.point.distance_to(c2.point),
-                climb_m=0.0
+                climb_m=0.0,
+                estimated_time_s=c1.point.distance_to(c2.point) * self.config.base_pace_s_per_m
             )
 
             new_leg = CourseLeg(
@@ -896,32 +1093,52 @@ class CourseManager:
                 route_choice=rc_analysis,
                 distance_m=opt_path.distance_m,
                 climb_m=opt_path.climb_m,
-                cost=opt_path.cost
+                cost=opt_path.cost,
+                estimated_time_s=opt_path.estimated_time_s
             )
             updated_legs.append(new_leg)
             rerouted_legs.append(i + 1)
             total_dist += new_leg.distance_m
             total_climb += new_leg.climb_m
+            total_time += new_leg.estimated_time_s
             total_rc_score += rc_analysis.score
+
+        # Varianz-Statistik
+        leg_dists = [l.distance_m for l in updated_legs]
+        if len(leg_dists) > 1:
+            mean_d = sum(leg_dists) / len(leg_dists)
+            var_d = sum((d - mean_d) ** 2 for d in leg_dists) / len(leg_dists)
+            std_d = math.sqrt(var_d)
+            cv_d = std_d / (mean_d + 1e-9)
+        else:
+            cv_d = 0.0
+
+        short_count = sum(1 for d in leg_dists if d <= self.config.short_leg_max_m)
+        long_count = sum(1 for d in leg_dists if d >= self.config.long_leg_min_m)
 
         # Bahn aktualisieren
         conflicts = check_intersections(self.course.controls)
         angle_warnings = []
-        for i in range(1, len(self.course.controls) - 1):
-            is_valid, alpha = check_angle(
-                self.course.controls[i - 1].point, self.course.controls[i].point, self.course.controls[i + 1].point,
-                min_angle_deg=self.config.min_angle_deg,
-                allow_hairpin=self.config.allow_hairpin
-            )
-            if not is_valid:
-                angle_warnings.append(
-                    f"Spitze Kehre an Posten {self.course.controls[i].id} ({alpha:.1f}° < {self.config.min_angle_deg}°)"
+        if not self.config.allow_hairpin:
+            for i in range(1, len(self.course.controls) - 1):
+                is_valid, alpha = check_angle(
+                    self.course.controls[i - 1].point, self.course.controls[i].point, self.course.controls[i + 1].point,
+                    min_angle_deg=self.config.min_angle_deg,
+                    allow_hairpin=self.config.allow_hairpin
                 )
+                if not is_valid:
+                    angle_warnings.append(
+                        f"Spitze Kehre an Posten {self.course.controls[i].id} ({alpha:.1f}° < {self.config.min_angle_deg}°)"
+                    )
 
         self.course.legs = updated_legs
         self.course.total_distance_m = total_dist
         self.course.total_climb_m = total_climb
+        self.course.total_time_s = total_time
         self.course.total_route_choice_score = total_rc_score
+        self.course.leg_variance_cv = cv_d
+        self.course.short_legs_count = short_count
+        self.course.long_legs_count = long_count
         self.course.intersection_conflicts = conflicts
         self.course.angle_warnings = angle_warnings
         self.course.is_geometrically_valid = (len(conflicts) == 0 and len(angle_warnings) == 0)
