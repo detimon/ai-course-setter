@@ -1,0 +1,13 @@
+{
+  "folders": [
+    {
+      "name": "ai-course-setter",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "python.analysis.extraPaths": [
+      "."
+    ]
+  }
+}
