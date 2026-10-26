@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Course Setter - Intelligente OL-Bahnlegung</title>
+  <link rel="stylesheet" href="vendor/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app-container">
+    <!-- SIDEBAR -->
+    <aside id="sidebar">
+      <header class="sidebar-header">
+        <div class="logo-row">
+          <span class="logo-icon">🧭</span>
+          <div>
+            <h1>AI Course Setter</h1>
+            <span class="badge">TASK 2 • KARTEN-UI</span>
+          </div>
+        </div>
+        <p class="subtitle">Regelbasierte OL-Bahnlegung mit semantischem Geländemodell</p>
+      </header>
+
+      <!-- PARAMETER CONTROLS -->
+      <section class="panel">
+        <h2 class="panel-title">1. Bahn-Parameter</h2>
+
+        <div class="control-group">
+          <div class="label-row">
+            <label for="input-distance">Soll-Distanz</label>
+            <span id="val-distance" class="val-badge">1050 m</span>
+          </div>
+          <input type="range" id="input-distance" min="500" max="2500" step="50" value="1050">
+        </div>
+
+        <div class="control-group">
+          <div class="label-row">
+            <label for="input-elevation">Soll-Höhenmeter</label>
+            <span id="val-elevation" class="val-badge">20 Hm</span>
+          </div>
+          <input type="range" id="input-elevation" min="0" max="60" step="5" value="20">
+        </div>
+
+        <div class="control-row-2">
+          <div class="control-group">
+            <div class="label-row">
+              <label for="input-controls">Posten</label>
+              <span id="val-controls" class="val-badge">4</span>
+            </div>
+            <input type="range" id="input-controls" min="2" max="6" step="1" value="4">
+          </div>
+
+          <div class="control-group">
+            <div class="label-row">
+              <label for="input-routes">K-Pfade</label>
+              <span id="val-routes" class="val-badge">3</span>
+            </div>
+            <input type="range" id="input-routes" min="1" max="5" step="1" value="3">
+          </div>
+        </div>
+
+        <div class="control-group">
+          <div class="label-row">
+            <label for="input-variance">Rhythmus / Varianz</label>
+            <span id="val-variance" class="val-badge">0.60 (Kurz & Lang)</span>
+          </div>
+          <input type="range" id="input-variance" min="0.0" max="1.0" step="0.05" value="0.60">
+          <div class="slider-ticks">
+            <span>0.0 (Gleichmässig)</span>
+            <span>0.5 (Ausgewogen)</span>
+            <span>1.0 (Extrem)</span>
+          </div>
+        </div>
+
+        <div class="control-checkbox">
+          <input type="checkbox" id="input-hairpin">
+          <label for="input-hairpin">Spitze Kehren erlauben (&lt; 60° Wendewinkel)</label>
+        </div>
+
+        <button id="btn-generate" class="btn btn-primary">
+          <span class="btn-icon">⚡</span> Bahn generieren / optimieren
+        </button>
+      </section>
+
+      <!-- SPONSORED ACTIONS / OBSTACLES -->
+      <section class="panel">
+        <h2 class="panel-title">2. Interaktive Werkzeuge</h2>
+        <div class="btn-group-row">
+          <button id="btn-draw-obstacle" class="btn btn-danger">
+            <span class="btn-icon">🛑</span> Sperrgebiet zeichnen
+          </button>
+          <button id="btn-reset-obstacles" class="btn btn-secondary">
+            <span class="btn-icon">↺</span> Reset
+          </button>
+        </div>
+        <div id="draw-help" class="help-text hidden">
+          Klicke auf die Karte, um Ecken zu setzen. Schliesse das Polygon mit einem Doppelklick oder Klick auf den Startpunkt.
+        </div>
+      </section>
+
+      <!-- METRICS & HUD -->
+      <section class="panel" id="metrics-panel">
+        <h2 class="panel-title">3. Bahn-Statistiken</h2>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-label">Länge</span>
+            <span id="stat-dist" class="stat-value">-- m</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Höhe</span>
+            <span id="stat-climb" class="stat-value">-- Hm</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Laufzeit</span>
+            <span id="stat-time" class="stat-value">-- min</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Rhythmus (CV)</span>
+            <span id="stat-cv" class="stat-value">--</span>
+          </div>
+        </div>
+
+        <div class="status-row">
+          <span id="stat-validity" class="badge badge-success">Gültig</span>
+          <span id="stat-rc-score" class="val-highlight">Routenwahl-Score: 0.0</span>
+        </div>
+      </section>
+
+      <!-- LEGS BREAKDOWN -->
+      <section class="panel panel-expandable" id="legs-panel">
+        <h2 class="panel-title">4. Teilstrecken & K-Alternativen</h2>
+        <div id="legs-list" class="legs-list">
+          <p class="placeholder-text">Noch keine Bahn generiert.</p>
+        </div>
+      </section>
+    </aside>
+
+    <!-- MAP CONTAINER -->
+    <main id="main-content">
+      <div id="map"></div>
+
+      <!-- MAP OVERLAYS & LEGEND -->
+      <div id="map-legend" class="map-overlay">
+        <h3>OL-Kartenlegende</h3>
+        <div class="legend-grid">
+          <div class="legend-item"><span class="legend-color color-white"></span> Weisser Wald (100%)</div>
+          <div class="legend-item"><span class="legend-color color-yellow"></span> Offenes Land</div>
+          <div class="legend-item"><span class="legend-color color-green1"></span> Grün 1 (Schwer belaufbar)</div>
+          <div class="legend-item"><span class="legend-color color-green3"></span> Grün 3 (Brombeer-Dickicht)</div>
+          <div class="legend-item"><span class="legend-color color-blue"></span> Waldsee (Unpassierbar)</div>
+          <div class="legend-item"><span class="legend-color color-red"></span> Sperrzone (Reaktiv!)</div>
+          <div class="legend-item"><span class="legend-color color-wall"></span> Mauer (Unpassierbar)</div>
+          <div class="legend-item"><span class="legend-color color-road"></span> Waldweg (Speed-Bonus)</div>
+        </div>
+        <hr class="legend-sep">
+        <div class="legend-routes">
+          <div class="legend-item"><span class="route-line color-route1"></span> Route 1 (Optimal)</div>
+          <div class="legend-item"><span class="route-line color-route2"></span> Route 2 (Alternative)</div>
+          <div class="legend-item"><span class="route-line color-route3"></span> Route 3 (Alternative)</div>
+        </div>
+      </div>
+
+      <!-- FLOATING TOAST / STATUS -->
+      <div id="toast" class="toast hidden"></div>
+    </main>
+  </div>
+
+  <script src="vendor/leaflet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

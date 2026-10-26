@@ -165,12 +165,13 @@ Das Testskript validiert das System in 4 strukturierten Stufen:
 - [ ] Raster-Segmentierer (Farbzerlegung für gescannte Karten / PDFs)
 - [ ] Digitales Geländemodell (DHM / GeoTIFF / SRTM) Integration
 
-### Phase 3: Interaktives Web-Frontend
-- [ ] Backend-API mit FastAPI / WebSockets für Echtzeit-Interaktion
-- [ ] MapLibre / Leaflet Kartenkomponente mit OL-Farbschema
-- [ ] Interaktiver Co-Pilot: Posten per Drag & Drop verschieben, fixieren, neu routen
-- [ ] Sperrzonen-Zeichentool (Polygon-Editor direkt auf der Karte)
-- [ ] Live-HUD mit Längenbudget, Höhenmetern, Routenwahl-Statistiken
+### Phase 3: Interaktives Web-Frontend (TASK 2 - Abgeschlossen)
+- [x] Backend-API mit FastAPI (`app.py`) mit CORS und REST-Endpunkten (`/api/terrain`, `/api/generate`, `/api/obstacle`, `/api/move-control`)
+- [x] Leaflet Kartenkomponente (`frontend/`) mit L.CRS.Simple und IOF-Farbschema (Wald, Offen, Grün 1–3, Wasser, Mauern, Wege)
+- [x] Interaktiver Co-Pilot: Posten per Drag & Drop mit der Maus verschieben, Teilstrecken rechnen sich in Echtzeit neu aus
+- [x] Sperrzonen-Zeichentool ("[+ Sperrgebiet]"): Polygon direkt auf Karte zeichnen mit sofortiger reaktiver Umgehung
+- [x] Live-HUD & Sidebar mit Längenbudget, Höhenmetern, Rhythmus/Varianz-Slider, K-Routenwahl-Vergleich
+- [x] Automatisierte E2E-Tests (`test_api.py`) für API-Endpunkte und statische Assets
 
 ### Phase 4: Standard-Export & Interoperabilität
 - [ ] IOF XML 3.0 Export (Standardformat für OCAD, Condes, Purple Pen)
